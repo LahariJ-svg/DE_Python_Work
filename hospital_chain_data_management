@@ -1,0 +1,252 @@
+import sqlite3
+from datetime import datetime, timedelta
+
+# Connect to SQLite database 
+conn = sqlite3.connect(':memory:')
+cursor = conn.cursor()
+
+# Create the staging table
+def create_staging_table():
+    cursor.execute('''CREATE TABLE Staging_Customers (
+        Customer_Name TEXT,
+        Customer_ID TEXT,
+        Open_Date DATE,
+        Last_Consulted_Date DATE,
+        Vaccination_Type TEXT,
+        Doctor_Consulted TEXT,
+        State TEXT,
+        Country TEXT,
+        DOB DATE,
+        Is_Active TEXT
+    )''')
+    
+
+
+# Create country-specific tables based on unique country values
+def create_country_tables():
+    cursor.execute('SELECT DISTINCT Country FROM Staging_Customers')
+    countries = cursor.fetchall()
+    for country in countries:
+        country_name = country[0]
+        cursor.execute(f'''
+        CREATE TABLE Table_{country_name} (
+            Customer_Name TEXT,
+            Customer_ID TEXT,
+            Open_Date DATE,
+            Last_Consulted_Date DATE,
+            Vaccination_Type TEXT,
+            Doctor_Consulted TEXT,
+            State TEXT,
+            Country TEXT,
+            DOB DATE,
+            Is_Active TEXT,
+            Age INTEGER,
+            Days_Since_Last_Consulted INTEGER
+        )
+        ''')
+        
+
+# Function to calculate age based on DOB
+def calculate_age(dob):
+    dob_date = datetime.strptime(dob, '%Y-%m-%d')
+    today = datetime.now()
+    return today.year - dob_date.year - ((today.month, today.day) < (dob_date.month, dob_date.day))
+
+
+
+
+
+
+# create validation queries for staging and country specific tables
+
+def validate_staging_table(cursor):
+    # Validate Unique Customer ID
+    cursor.execute('''
+    SELECT Customer_ID, COUNT(*) 
+    FROM Staging_Customers 
+    GROUP BY Customer_ID 
+    HAVING COUNT(*) > 1;
+    ''')
+    duplicates = cursor.fetchall()
+    print("Duplicate Customer IDs:", duplicates)
+
+
+    # Validate Non-nullable Columns
+    cursor.execute('''
+    SELECT * 
+    FROM Staging_Customers 
+    WHERE Customer_Name IS NULL OR Customer_ID IS NULL OR Open_Date IS NULL;
+    ''')
+    null_values = cursor.fetchall()
+    print("Records with Null Values in Mandatory Columns:", null_values)
+
+    # Check for Invalid Date of Birth
+    cursor.execute('''
+    SELECT * 
+    FROM Staging_Customers 
+    WHERE DOB > DATE('now');
+    ''')
+    invalid_dob = cursor.fetchall()
+    print("Invalid Date of Birth Records:", invalid_dob)
+
+    # Check for Invalid Consultation Dates
+    cursor.execute('''
+    SELECT * 
+    FROM Staging_Customers 
+    WHERE Last_Consulted_Date < Open_Date;
+    ''')
+    invalid_dates = cursor.fetchall()
+    print("Invalid Consultation Dates Records:", invalid_dates)
+
+    # Validate Active/Inactive Status
+    cursor.execute('''
+    SELECT * 
+    FROM Staging_Customers 
+    WHERE Is_Active NOT IN ('A', 'I');
+    ''')
+    invalid_status = cursor.fetchall()
+    print("Invalid Active/Inactive Status Records:", invalid_status)
+
+    
+# validate country specific data
+def validate_country_table(cursor, country):
+    # Validate Unique Customer ID within the country table
+    cursor.execute(f'''
+    SELECT Customer_ID, COUNT(*) 
+    FROM Table_{country} 
+    GROUP BY Customer_ID 
+    HAVING COUNT(*) > 1;
+    ''')
+    duplicates = cursor.fetchall()
+    print(f"Duplicate Customer IDs in Table_{country}:", duplicates)
+
+    # Check Consistent Age Calculation
+    cursor.execute(f'''
+    SELECT Customer_ID, DOB, Age, 
+           FLOOR((JULIANDAY('now') - JULIANDAY(DOB)) / 365) AS Calculated_Age 
+    FROM Table_{country} 
+    WHERE Age != FLOOR((JULIANDAY('now') - JULIANDAY(DOB)) / 365) OR DOB IS NULL OR Age IS NULL;
+    ''')
+    inconsistent_age = cursor.fetchall()
+    print(f"Inconsistent Age Records in Table_{country}:", inconsistent_age)
+
+    # Check for Multiple Active Records
+    cursor.execute(f'''
+    SELECT Customer_ID, COUNT(*) 
+    FROM Table_{country} 
+    WHERE Is_Active = 'A' 
+    GROUP BY Customer_ID 
+    HAVING COUNT(*) > 1;
+    ''')
+    multiple_active = cursor.fetchall()
+    print(f"Multiple Active Records in Table_{country}:", multiple_active)
+
+    # Check for the Most Recent Consultation Date
+    cursor.execute(f'''
+    SELECT * 
+    FROM Table_{country} t 
+    JOIN (
+        SELECT Customer_ID, MAX(Last_Consulted_Date) AS MaxDate 
+        FROM Table_{country} 
+        GROUP BY Customer_ID
+    ) latest 
+    ON t.Customer_ID = latest.Customer_ID 
+    WHERE t.Is_Active = 'A' AND t.Last_Consulted_Date != latest.MaxDate;
+    ''')
+    inconsistent_consultation_dates = cursor.fetchall()
+    print(f"Inconsistent Consultation Dates in Table_{country}:", inconsistent_consultation_dates)
+
+    # Validate Non-nullable Columns
+    cursor.execute(f'''
+    SELECT * 
+    FROM Table_{country} 
+    WHERE Customer_Name IS NULL OR Customer_ID IS NULL OR Last_Consulted_Date IS NULL;
+    ''')
+    null_values = cursor.fetchall()
+    print(f"Records with Null Values in Mandatory Columns in Table_{country}:", null_values)
+
+
+
+
+
+
+
+# Function to update the staging table when a customer moves between countries
+def update_staging_table(customer_id, new_country, last_consulted_date):
+    # Get the current active country for the customer
+    cursor.execute('''SELECT Country, Last_Consulted_Date, DOB 
+                      FROM Staging_Customers 
+                      WHERE Customer_ID = ? AND Is_Active = 'A' LIMIT 1''', (customer_id,))
+    result = cursor.fetchone()
+    
+    if result:
+        prev_visited_cntry, prev_consulted_date, dob = result
+        # Expire the existing record if the customer has moved
+        if prev_visited_cntry != new_country:
+            cursor.execute('''UPDATE Staging_Customers
+                              SET Is_Active = 'I'
+                              WHERE Customer_ID = ? AND Country = ?''', (customer_id, prev_visited_cntry))
+    
+    # Step 3: Insert or update the new country's record and set it as active
+    age = calculate_age(dob)
+    days_since_last_consulted = (datetime.now() - datetime.strptime(last_consulted_date, '%Y-%m-%d')).days
+    cursor.execute('''INSERT INTO Staging_Customers (Customer_Name, Customer_ID, Open_Date, Last_Consulted_Date, 
+                                   Vaccination_Type, Doctor_Consulted, State, Country, DOB, Is_Active)
+                      SELECT Customer_Name, Customer_ID, Open_Date, ?, Vaccination_Type, Doctor_Consulted, State, ?, DOB, 'A'
+                      FROM Staging_Customers WHERE Customer_ID = ?
+                      ON CONFLICT(Customer_ID, Country) DO UPDATE
+                      SET Last_Consulted_Date = ?, Is_Active = 'A' ''', (last_consulted_date, new_country, customer_id, last_consulted_date))
+    
+# Function to update the country-specific tables based on the staging table
+def update_country_tables(customer_id, new_country):
+    #  Fetch customer details from staging table
+    cursor.execute('''SELECT * FROM Staging_Customers WHERE Customer_ID = ? AND Country = ?''', (customer_id, new_country))
+    customer = cursor.fetchone()
+
+    if customer:
+        (Customer_Name, Customer_ID, Open_Date, Last_Consulted_Date, 
+        Vaccination_Type, Doctor_Consulted, State, Country, DOB, Is_Active) = customer
+        
+        # Calculate age and days since last consulted
+        age = calculate_age(DOB)
+        days_since_last_consulted = (datetime.now() - datetime.strptime(Last_Consulted_Date, '%Y-%m-%d')).days
+        
+        # Update or insert into the new country's table
+        cursor.execute(f'''INSERT INTO Table_{new_country} (Customer_Name, Customer_ID, Open_Date, Last_Consulted_Date, 
+                                         Vaccination_Type, Doctor_Consulted, State, Country, DOB, Is_Active, Age, Days_Since_Last_Consulted)
+                          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                          ON CONFLICT(Customer_ID) DO UPDATE
+                          SET Last_Consulted_Date = ?, Is_Active = 'A', Age = ?, Days_Since_Last_Consulted = ?''',
+                       (Customer_Name, Customer_ID, Open_Date, Last_Consulted_Date, Vaccination_Type, 
+                        Doctor_Consulted, State, Country, DOB, Is_Active, age, days_since_last_consulted, 
+                        Last_Consulted_Date, age, days_since_last_consulted))
+        print(f"Updated Table_{new_country} for customer {customer_id}.")
+    
+    # Expire existing records in the previous country table if necessary
+    cursor.execute('''SELECT Country FROM Staging_Customers 
+                      WHERE Customer_ID = ? AND Is_Active = 'I' ''', (customer_id,))
+    deactivated_countries = cursor.fetchall()
+
+    for country in deactivated_countries:
+        cursor.execute(f'''UPDATE Table_{country[0]} SET Is_Active = 'I' WHERE Customer_ID = ?''', (customer_id,))
+        
+#  Update staging and country tables when a customer moves
+def main():
+    create_staging_table()
+    create_country_tables()
+
+    # Simulate a customer moving from 'USA' to 'IND' with a new consultation date
+    update_staging_table('123457', 'IND', '2023-10-15')
+    update_country_tables('123457', 'IND')
+    validate_staging_table(cursor)
+    validate_country_table(cursor, 'IND')
+
+
+if __name__ == "__main__":
+    main()
+
+# Close the database connection
+conn.close()
+
+
+
